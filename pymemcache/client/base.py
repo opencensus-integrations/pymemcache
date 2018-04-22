@@ -16,6 +16,8 @@ import socket
 import six
 
 from pymemcache import pool
+from opencensus.trace.tracer import Tracer
+from opencensus.trace import execution_context
 
 from pymemcache.exceptions import (
     MemcacheClientError,
@@ -245,35 +247,45 @@ class Client(object):
         self.default_noreply = default_noreply
         self.allow_unicode_keys = allow_unicode_keys
 
+        self._tracer = execution_context.get_opencensus_tracer() or Tracer()
+
     def check_key(self, key):
         """Checks key and add key_prefix."""
-        return _check_key(key, allow_unicode_keys=self.allow_unicode_keys,
+        with self._tracer.span(name='pymemcache.client.Client.check_key'):
+            return _check_key(key, allow_unicode_keys=self.allow_unicode_keys,
                           key_prefix=self.key_prefix)
 
     def _connect(self):
-        sock = self.socket_module.socket(self.socket_module.AF_INET,
-                                         self.socket_module.SOCK_STREAM)
-        try:
-            sock.settimeout(self.connect_timeout)
-            sock.connect(self.server)
-            sock.settimeout(self.timeout)
-            if self.no_delay:
-                sock.setsockopt(self.socket_module.IPPROTO_TCP,
-                                self.socket_module.TCP_NODELAY, 1)
-        except Exception:
-            sock.close()
-            raise
-        self.sock = sock
+        with self._tracer.span(name='pymemcache.client.Client._connect') as span:
+            sock = self.socket_module.socket(self.socket_module.AF_INET,
+                                            self.socket_module.SOCK_STREAM)
+            try:
+                span.add_annotation('Setting socket timeout', value=self.connect_timeout)
+                sock.settimeout(self.connect_timeout)
+                sock.connect(self.server)
+                sock.settimeout(self.timeout)
+                if self.no_delay:
+                    sock.setsockopt(self.socket_module.IPPROTO_TCP,
+                                    self.socket_module.TCP_NODELAY, 1)
+            except Exception:
+                sock.close()
+                raise
+            self.sock = sock
 
     def close(self):
         """Close the connection to memcached, if it is open. The next call to a
         method that requires a connection will re-open it."""
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-        self.sock = None
+        with self._tracer.span(name='pymemcache.client.Client.close') as span:
+            if self.sock is not None:
+                span.add_annotation('Socket is still open')
+                try:
+                    span.add_annotation('Attempting to close socket')
+                    self.sock.close()
+                except Exception as e:
+                    span.add_annotation('Encountered an exception while closing', error=str(e))
+                else:
+                    span.add_annotation('Closed socket')
+            self.sock = None
 
     def set(self, key, value, expire=0, noreply=None):
         """
@@ -292,9 +304,13 @@ class Client(object):
           raised, the set may or may not have occurred. If noreply is True,
           then a successful return does not guarantee a successful set.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        return self._store_cmd(b'set', key, expire, noreply, value)
+        with self._tracer.span(name='pymemcache.client.Client.set') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+                span.add_annotation('Noreply is unset, hence using default_noreply')
+            else:
+                span.add_annotation('Noreply was already set')
+            return self._store_cmd(b'set', key, expire, noreply, value)
 
     def set_many(self, values, expire=0, noreply=None):
         """
@@ -317,9 +333,11 @@ class Client(object):
 
         # TODO: make this more performant by sending all the values first, then
         # waiting for all the responses.
-        for key, value in six.iteritems(values):
-            self.set(key, value, expire, noreply)
-        return True
+        with self._tracer.span(name='pymemcache.client.Client.set_many') as span:
+            span.add_annotation('Setting many', count=len(values))
+            for key, value in six.iteritems(values):
+                self.set(key, value, expire, noreply)
+            return True
 
     set_multi = set_many
 
@@ -340,9 +358,13 @@ class Client(object):
           return value is True if the value was stored, and False if it was
           not (because the key already existed).
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        return self._store_cmd(b'add', key, expire, noreply, value)
+        with self._tracer.span(name='pymemcache.client.Client.add') as span:
+            if noreply is None:
+                span.add_annotation('Noreply is unset, hence using default_noreply')
+                noreply = self.default_noreply
+            else:
+                span.add_annotation('Noreply was already set')
+            return self._store_cmd(b'add', key, expire, noreply, value)
 
     def replace(self, key, value, expire=0, noreply=None):
         """
@@ -361,9 +383,12 @@ class Client(object):
           the value was stored and False if it wasn't (because the key didn't
           already exist).
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        return self._store_cmd(b'replace', key, expire, noreply, value)
+        with self._tracer.span(name='pymemcache.client.Client.replace') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            else:
+                span.add_annotation('Noreply was already set')
+            return self._store_cmd(b'replace', key, expire, noreply, value)
 
     def append(self, key, value, expire=0, noreply=None):
         """
@@ -380,9 +405,10 @@ class Client(object):
         Returns:
           True.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        return self._store_cmd(b'append', key, expire, noreply, value)
+        with self._tracer.span(name='pymemcache.client.Client.append') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            return self._store_cmd(b'append', key, expire, noreply, value)
 
     def prepend(self, key, value, expire=0, noreply=None):
         """
@@ -399,9 +425,10 @@ class Client(object):
         Returns:
           True.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        return self._store_cmd(b'prepend', key, expire, noreply, value)
+        with self._tracer.span(name='pymemcache.client.Client.prepend') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            return self._store_cmd(b'prepend', key, expire, noreply, value)
 
     def cas(self, key, value, cas, expire=0, noreply=False):
         """
@@ -420,7 +447,8 @@ class Client(object):
           the key didn't exist, False if it existed but had a different cas
           value and True if it existed and was changed.
         """
-        return self._store_cmd(b'cas', key, expire, noreply, value, cas)
+        with self._tracer.span(name='pymemcache.client.Client.cas') as span:
+            return self._store_cmd(b'cas', key, expire, noreply, value, cas)
 
     def get(self, key, default=None):
         """
@@ -433,7 +461,8 @@ class Client(object):
         Returns:
           The value for the key, or default if the key wasn't found.
         """
-        return self._fetch_cmd(b'get', [key], False).get(key, default)
+        with self._tracer.span(name='pymemcache.client.Client.get') as span:
+            return self._fetch_cmd(b'get', [key], False).get(key, default)
 
     def get_many(self, keys):
         """
@@ -447,10 +476,13 @@ class Client(object):
           and the values are values from the cache. The dict may contain all,
           some or none of the given keys.
         """
-        if not keys:
-            return {}
+        with self._tracer.span(name='pymemcache.client.Client.get') as span:
+            if not keys:
+                span.add_annotation('No keys set')
+                return {}
 
-        return self._fetch_cmd(b'get', keys, False)
+            span.add_annotation('Performing get')
+            return self._fetch_cmd(b'get', keys, False)
 
     get_multi = get_many
 
@@ -468,7 +500,8 @@ class Client(object):
           or (default, cas_defaults) if the key was not found.
         """
         defaults = (default, cas_default)
-        return self._fetch_cmd(b'gets', [key], True).get(key, defaults)
+        with self._tracer.span(name='pymemcache.client.Client.gets'):
+            return self._fetch_cmd(b'gets', [key], True).get(key, defaults)
 
     def gets_many(self, keys):
         """
@@ -482,10 +515,11 @@ class Client(object):
           the values are tuples of (value, cas) from the cache. The dict may
           contain all, some or none of the given keys.
         """
-        if not keys:
-            return {}
+        with self._tracer.span(name='pymemcache.client.Client.gets_many') as span:
+            if not keys:
+                return {}
 
-        return self._fetch_cmd(b'gets', keys, True)
+            return self._fetch_cmd(b'gets', keys, True)
 
     def delete(self, key, noreply=None):
         """
@@ -500,16 +534,17 @@ class Client(object):
           If noreply is True, always returns True. Otherwise returns True if
           the key was deleted, and False if it wasn't found.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        cmd = b'delete ' + self.check_key(key)
-        if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        result = self._misc_cmd(cmd, b'delete', noreply)
-        if noreply:
-            return True
-        return result == b'DELETED'
+        with self._tracer.span(name='pymemcache.client.Client.delete') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            cmd = b'delete ' + self.check_key(key)
+            if noreply:
+                cmd += b' noreply'
+            cmd += b'\r\n'
+            result = self._misc_cmd(cmd, b'delete', noreply)
+            if noreply:
+                return True
+            return result == b'DELETED'
 
     def delete_many(self, keys, noreply=None):
         """
@@ -526,18 +561,19 @@ class Client(object):
           memcache for deletion and if noreply is False, they have been
           acknowledged by memcache.
         """
-        if not keys:
+        with self._tracer.span(name='pymemcache.client.Client.delete_many') as span:
+            if not keys:
+                return True
+
+            if noreply is None:
+                noreply = self.default_noreply
+
+            # TODO: make this more performant by sending all keys first, then
+            # waiting for all values.
+            for key in keys:
+                self.delete(key, noreply)
+
             return True
-
-        if noreply is None:
-            noreply = self.default_noreply
-
-        # TODO: make this more performant by sending all keys first, then
-        # waiting for all values.
-        for key in keys:
-            self.delete(key, noreply)
-
-        return True
 
     delete_multi = delete_many
 
@@ -554,17 +590,18 @@ class Client(object):
           If noreply is True, always returns None. Otherwise returns the new
           value of the key, or None if the key wasn't found.
         """
-        key = self.check_key(key)
-        cmd = b'incr ' + key + b' ' + six.text_type(value).encode('ascii')
-        if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        result = self._misc_cmd(cmd, b'incr', noreply)
-        if noreply:
-            return None
-        if result == b'NOT_FOUND':
-            return None
-        return int(result)
+        with self._tracer.span(name='pymemcache.client.Client.incr') as span:
+            key = self.check_key(key)
+            cmd = b'incr ' + key + b' ' + six.text_type(value).encode('ascii')
+            if noreply:
+                cmd += b' noreply'
+            cmd += b'\r\n'
+            result = self._misc_cmd(cmd, b'incr', noreply)
+            if noreply:
+                return None
+            if result == b'NOT_FOUND':
+                return None
+            return int(result)
 
     def decr(self, key, value, noreply=False):
         """
@@ -579,17 +616,18 @@ class Client(object):
           If noreply is True, always returns None. Otherwise returns the new
           value of the key, or None if the key wasn't found.
         """
-        key = self.check_key(key)
-        cmd = b'decr ' + key + b' ' + six.text_type(value).encode('ascii')
-        if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        result = self._misc_cmd(cmd, b'decr', noreply)
-        if noreply:
-            return None
-        if result == b'NOT_FOUND':
-            return None
-        return int(result)
+        with self._tracer.span(name='pymemcache.client.Client.decr') as span:
+            key = self.check_key(key)
+            cmd = b'decr ' + key + b' ' + six.text_type(value).encode('ascii')
+            if noreply:
+                cmd += b' noreply'
+            cmd += b'\r\n'
+            result = self._misc_cmd(cmd, b'decr', noreply)
+            if noreply:
+                return None
+            if result == b'NOT_FOUND':
+                return None
+            return int(result)
 
     def touch(self, key, expire=0, noreply=None):
         """
@@ -606,17 +644,18 @@ class Client(object):
           True if the expiration time was updated, False if the key wasn't
           found.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        key = self.check_key(key)
-        cmd = b'touch ' + key + b' ' + six.text_type(expire).encode('ascii')
-        if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        result = self._misc_cmd(cmd, b'touch', noreply)
-        if noreply:
-            return True
-        return result == b'TOUCHED'
+        with self._tracer.span(name='pymemcache.client.Client.touch') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            key = self.check_key(key)
+            cmd = b'touch ' + key + b' ' + six.text_type(expire).encode('ascii')
+            if noreply:
+                cmd += b' noreply'
+            cmd += b'\r\n'
+            result = self._misc_cmd(cmd, b'touch', noreply)
+            if noreply:
+                return True
+            return result == b'TOUCHED'
 
     def stats(self, *args):
         """
@@ -633,16 +672,17 @@ class Client(object):
         Returns:
           A dict of the returned stats.
         """
-        result = self._fetch_cmd(b'stats', args, False)
+        with self._tracer.span(name='pymemcache.client.Client.stats') as span:
+            result = self._fetch_cmd(b'stats', args, False)
 
-        for key, value in six.iteritems(result):
-            converter = STAT_TYPES.get(key, int)
-            try:
-                result[key] = converter(value)
-            except Exception:
-                pass
+            for key, value in six.iteritems(result):
+                converter = STAT_TYPES.get(key, int)
+                try:
+                    result[key] = converter(value)
+                except Exception:
+                    pass
 
-        return result
+            return result
 
     def version(self):
         """
@@ -651,14 +691,15 @@ class Client(object):
         Returns:
             A string of the memcached version.
         """
-        cmd = b"version\r\n"
-        result = self._misc_cmd(cmd, b'version', False)
+        with self._tracer.span(name='pymemcache.client.Client.version') as span:
+            cmd = b"version\r\n"
+            result = self._misc_cmd(cmd, b'version', False)
 
-        if not result.startswith(b'VERSION '):
-            raise MemcacheUnknownError(
-                    "Received unexpected response: %s" % (result, ))
+            if not result.startswith(b'VERSION '):
+                raise MemcacheUnknownError(
+                        "Received unexpected response: %s" % (result, ))
 
-        return result[8:]
+            return result[8:]
 
     def flush_all(self, delay=0, noreply=None):
         """
@@ -673,16 +714,17 @@ class Client(object):
         Returns:
           True.
         """
-        if noreply is None:
-            noreply = self.default_noreply
-        cmd = b'flush_all ' + six.text_type(delay).encode('ascii')
-        if noreply:
-            cmd += b' noreply'
-        cmd += b'\r\n'
-        result = self._misc_cmd(cmd, b'flush_all', noreply)
-        if noreply:
-            return True
-        return result == b'OK'
+        with self._tracer.span(name='pymemcache.client.Client.flush_all') as span:
+            if noreply is None:
+                noreply = self.default_noreply
+            cmd = b'flush_all ' + six.text_type(delay).encode('ascii')
+            if noreply:
+                cmd += b' noreply'
+            cmd += b'\r\n'
+            result = self._misc_cmd(cmd, b'flush_all', noreply)
+            if noreply:
+                return True
+            return result == b'OK'
 
     def quit(self):
         """
@@ -692,9 +734,10 @@ class Client(object):
         method on this object will re-open the connection, so this object can
         be re-used after quit.
         """
-        cmd = b"quit\r\n"
-        self._misc_cmd(cmd, b'quit', True)
-        self.close()
+        with self._tracer.span(name='pymemcache.client.Client.quit') as span:
+            cmd = b"quit\r\n"
+            self._misc_cmd(cmd, b'quit', True)
+            self.close()
 
     def _raise_errors(self, line, name):
         if line.startswith(b'ERROR'):
@@ -709,6 +752,10 @@ class Client(object):
             raise MemcacheServerError(error)
 
     def _fetch_cmd(self, name, keys, expect_cas):
+        with self._tracer.span(name='pymemcache.client.Client._fetch_cmd') as span:
+            return self.__fetch_cmd(name, keys, expect_cas, span)
+
+    def __fetch_cmd(self, name, keys, expect_cas, span):
         if name == b'stats':
             # stats commands can have multiple arguments
             #   `stats cachedump 1 1`
@@ -720,18 +767,28 @@ class Client(object):
 
         try:
             if not self.sock:
+                span.add_annotation('Unset socket so connecting')
                 self._connect()
 
+            span.add_annotation('Invoking self.sock.sendall')
             self.sock.sendall(cmd)
+            span.add_annotation('Finished invoking self.sock.sendall')
 
             buf = b''
             result = {}
             while True:
-                buf, line = _readline(self.sock, buf)
+                span.add_annotation('Reading a line from the socket')
+                buf, line = _readline(self.sock, buf, self._tracer)
+                span.add_annotation('Finished reading a line from the socket')
                 self._raise_errors(line, name)
+
+                span.add_annotation('Deserializing values now', name=name)
+
                 if line == b'END':
+                    span.add_annotation('Hit END in reading sequence')
                     return result
                 elif line.startswith(b'VALUE'):
+                    span.add_annotation('Got a value', expect_cas=expect_cas)
                     if expect_cas:
                         _, key, flags, size, cas = line.split()
                     else:
@@ -741,10 +798,13 @@ class Client(object):
                             raise ValueError("Unable to parse line %s: %s"
                                              % (line, str(e)))
 
-                    buf, value = _readvalue(self.sock, buf, int(size))
+                    span.add_annotation('Reading a value from the socket')
+                    buf, value = _readvalue(self.sock, buf, int(size), self._tracer)
+                    span.add_annotation('Finished reading a value from the socket')
                     key = checked_keys[key]
 
                     if self.deserializer:
+                        span.add_annotation('Invoking the set deserializer')
                         value = self.deserializer(key, value, int(flags))
 
                     if expect_cas:
@@ -760,15 +820,22 @@ class Client(object):
                     result[key_value[1]] = b' '.join(key_value[2:])
                 else:
                     raise MemcacheUnknownError(line[:32])
-        except Exception:
+        except Exception as e:
+            span.add_annotation('Encountered an exception while reading', error=str(e))
             self.close()
             if self.ignore_exc:
+                span.add_annotation('Returning no error since ignore_exc was set')
                 return {}
-            raise
+            raise e
 
     def _store_cmd(self, name, key, expire, noreply, data, cas=None):
+        with self._tracer.span(name='pymemcache.client.Client._store_cmd') as span:
+            return self.__store_cmd(name, key, expire, noreply, data, span, cas)
+
+    def __store_cmd(self, name, key, expire, noreply, data, span, cas=None):
         key = self.check_key(key)
         if not self.sock:
+            span.add_annotation('Unset socket so connecting')
             self._connect()
 
         if self.serializer:
@@ -795,13 +862,16 @@ class Client(object):
                b'\r\n' + data + b'\r\n')
 
         try:
-            self.sock.sendall(cmd)
+            with self._tracer.span('self.sock.sendall') as span:
+                span.add_annotation('Invoking sendall')
+                self.sock.sendall(cmd)
+                span.add_annotation('Done invoking sendall')
 
             if noreply:
                 return True
 
             buf = b''
-            buf, line = _readline(self.sock, buf)
+            buf, line = _readline(self.sock, buf, self._tracer)
             self._raise_errors(line, name)
 
             if line in VALID_STORE_RESULTS[name]:
@@ -820,22 +890,23 @@ class Client(object):
             raise
 
     def _misc_cmd(self, cmd, cmd_name, noreply):
-        if not self.sock:
-            self._connect()
+        with self._tracer.span(name='pymemcache.client.Client._misc_cmd'):
+            if not self.sock:
+                self._connect()
 
-        try:
-            self.sock.sendall(cmd)
+            try:
+                self.sock.sendall(cmd)
 
-            if noreply:
-                return
+                if noreply:
+                    return
 
-            _, line = _readline(self.sock, b'')
-            self._raise_errors(line, cmd_name)
+                _, line = _readline(self.sock, b'', self._tracer)
+                self._raise_errors(line, cmd_name)
 
-            return line
-        except Exception:
-            self.close()
-            raise
+                return line
+            except Exception:
+                self.close()
+                raise
 
     def __setitem__(self, key, value):
         self.set(key, value, noreply=True)
@@ -899,150 +970,174 @@ class PooledClient(object):
             after_remove=lambda client: client.close(),
             max_size=max_pool_size,
             lock_generator=lock_generator)
+        self._tracer = execution_context.get_opencensus_tracer() or Tracer()
 
     def check_key(self, key):
         """Checks key and add key_prefix."""
-        return _check_key(key, allow_unicode_keys=self.allow_unicode_keys,
-                          key_prefix=self.key_prefix)
+        with self._tracer.span(name='pymemcache.client.PooleClient.check_key'):
+            return _check_key(key, allow_unicode_keys=self.allow_unicode_keys,
+                            key_prefix=self.key_prefix)
 
     def _create_client(self):
-        client = Client(self.server,
-                        serializer=self.serializer,
-                        deserializer=self.deserializer,
-                        connect_timeout=self.connect_timeout,
-                        timeout=self.timeout,
-                        no_delay=self.no_delay,
-                        # We need to know when it fails *always* so that we
-                        # can remove/destroy it from the pool...
-                        ignore_exc=False,
-                        socket_module=self.socket_module,
-                        key_prefix=self.key_prefix,
-                        default_noreply=self.default_noreply,
-                        allow_unicode_keys=self.allow_unicode_keys)
-        return client
+        with self._tracer.span(name='pymemcache.client.PooledClient._create_client'):
+            client = Client(self.server,
+                            serializer=self.serializer,
+                            deserializer=self.deserializer,
+                            connect_timeout=self.connect_timeout,
+                            timeout=self.timeout,
+                            no_delay=self.no_delay,
+                            # We need to know when it fails *always* so that we
+                            # can remove/destroy it from the pool...
+                            ignore_exc=False,
+                            socket_module=self.socket_module,
+                            key_prefix=self.key_prefix,
+                            default_noreply=self.default_noreply,
+                            allow_unicode_keys=self.allow_unicode_keys)
+            return client
 
     def close(self):
-        self.client_pool.clear()
+        with self._tracer.span(name='pymemcache.client.PooledClient.close'):
+            self.client_pool.clear()
 
     def set(self, key, value, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.set(key, value, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.set'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.set(key, value, expire=expire, noreply=noreply)
 
     def set_many(self, values, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.set_many(values, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.set_many'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.set_many(values, expire=expire, noreply=noreply)
 
     set_multi = set_many
 
     def replace(self, key, value, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.replace(key, value, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.replace'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.replace(key, value, expire=expire, noreply=noreply)
 
     def append(self, key, value, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.append(key, value, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.append'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.append(key, value, expire=expire, noreply=noreply)
 
     def prepend(self, key, value, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.prepend(key, value, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.prepend'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.prepend(key, value, expire=expire, noreply=noreply)
 
     def cas(self, key, value, cas, expire=0, noreply=False):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.cas(key, value, cas,
+        with self._tracer.span(name='pymemcache.client.PooledClient.cas'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.cas(key, value, cas,
                               expire=expire, noreply=noreply)
 
     def get(self, key, default=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                return client.get(key, default)
-            except Exception:
-                if self.ignore_exc:
-                    return None
-                else:
-                    raise
+        with self._tracer.span(name='pymemcache.client.PooledClient.get'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    return client.get(key, default)
+                except Exception:
+                    if self.ignore_exc:
+                        return None
+                    else:
+                        raise
 
     def get_many(self, keys):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                return client.get_many(keys)
-            except Exception:
-                if self.ignore_exc:
-                    return {}
-                else:
-                    raise
+        with self._tracer.span(name='pymemcache.client.PooledClient.get_many'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    return client.get_many(keys)
+                except Exception:
+                    if self.ignore_exc:
+                        return {}
+                    else:
+                        raise
 
     get_multi = get_many
 
     def gets(self, key):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                return client.gets(key)
-            except Exception:
-                if self.ignore_exc:
-                    return (None, None)
-                else:
-                    raise
+        with self._tracer.span(name='pymemcache.client.PooledClient.gets'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    return client.gets(key)
+                except Exception:
+                    if self.ignore_exc:
+                        return (None, None)
+                    else:
+                        raise
 
     def gets_many(self, keys):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                return client.gets_many(keys)
-            except Exception:
-                if self.ignore_exc:
-                    return {}
-                else:
-                    raise
+        with self._tracer.span(name='pymemcache.client.PooledClient.gets_many'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    return client.gets_many(keys)
+                except Exception:
+                    if self.ignore_exc:
+                        return {}
+                    else:
+                        raise
 
     def delete(self, key, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.delete(key, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.delete'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.delete(key, noreply=noreply)
 
     def delete_many(self, keys, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.delete_many(keys, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.delete_many'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.delete_many(keys, noreply=noreply)
 
     delete_multi = delete_many
 
     def add(self, key, value, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.add(key, value, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.add'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.add(key, value, expire=expire, noreply=noreply)
 
     def incr(self, key, value, noreply=False):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.incr(key, value, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.incr'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.incr(key, value, noreply=noreply)
 
     def decr(self, key, value, noreply=False):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.decr(key, value, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.decr'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.decr(key, value, noreply=noreply)
 
     def touch(self, key, expire=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.touch(key, expire=expire, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.touch'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.touch(key, expire=expire, noreply=noreply)
 
     def stats(self, *args):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                return client.stats(*args)
-            except Exception:
-                if self.ignore_exc:
-                    return {}
-                else:
-                    raise
+        with self._tracer.span(name='pymemcache.client.PooledClient.stats'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    return client.stats(*args)
+                except Exception:
+                    if self.ignore_exc:
+                        return {}
+                    else:
+                        raise
 
     def version(self):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.version()
+        with self._tracer.span(name='pymemcache.client.PooledClient.version'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.version()
 
     def flush_all(self, delay=0, noreply=None):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            return client.flush_all(delay=delay, noreply=noreply)
+        with self._tracer.span(name='pymemcache.client.PooledClient.flush_all'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                return client.flush_all(delay=delay, noreply=noreply)
 
     def quit(self):
-        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-            try:
-                client.quit()
-            finally:
-                self.client_pool.destroy(client)
+        with self._tracer.span(name='pymemcache.client.PooledClient.quit'):
+            with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+                try:
+                    client.quit()
+                finally:
+                    self.client_pool.destroy(client)
 
     def __setitem__(self, key, value):
         self.set(key, value, noreply=True)
@@ -1057,7 +1152,7 @@ class PooledClient(object):
         self.delete(key, noreply=True)
 
 
-def _readline(sock, buf):
+def _readline(sock, buf, tracer):
     """Read line of text from the socket.
 
     Read a line of text (delimited by "\r\n") from the socket, and
@@ -1080,32 +1175,32 @@ def _readline(sock, buf):
     chunks = []
     last_char = b''
 
-    while True:
-        # We're reading in chunks, so "\r\n" could appear in one chunk,
-        # or across the boundary of two chunks, so we check for both
-        # cases.
+    with tracer.span(name='pymemcache.client._readline') as span:
+        while True:
+            # We're reading in chunks, so "\r\n" could appear in one chunk,
+            # or across the boundary of two chunks, so we check for both
+            # cases.
 
-        # This case must appear first, since the buffer could have
-        # later \r\n characters in it and we want to get the first \r\n.
-        if last_char == b'\r' and buf[0:1] == b'\n':
-            # Strip the last character from the last chunk.
-            chunks[-1] = chunks[-1][:-1]
-            return buf[1:], b''.join(chunks)
-        elif buf.find(b'\r\n') != -1:
-            before, sep, after = buf.partition(b"\r\n")
-            chunks.append(before)
-            return after, b''.join(chunks)
+            # This case must appear first, since the buffer could have
+            # later \r\n characters in it and we want to get the first \r\n.
+            if last_char == b'\r' and buf[0:1] == b'\n':
+                # Strip the last character from the last chunk.
+                chunks[-1] = chunks[-1][:-1]
+                return buf[1:], b''.join(chunks)
+            elif buf.find(b'\r\n') != -1:
+                before, sep, after = buf.partition(b"\r\n")
+                chunks.append(before)
+                return after, b''.join(chunks)
 
-        if buf:
-            chunks.append(buf)
-            last_char = buf[-1:]
+            if buf:
+                chunks.append(buf)
+                last_char = buf[-1:]
 
-        buf = _recv(sock, RECV_SIZE)
-        if not buf:
-            raise MemcacheUnexpectedCloseError()
+            buf = _recv(sock, RECV_SIZE, tracer)
+            if not buf:
+                raise MemcacheUnexpectedCloseError()
 
-
-def _readvalue(sock, buf, size):
+def _readvalue(sock, buf, size, tracer):
     """Read specified amount of bytes from the socket.
 
     Read size bytes, followed by the "\r\n" characters, from the socket,
@@ -1125,36 +1220,37 @@ def _readvalue(sock, buf, size):
       including the \r\n).
 
     """
-    chunks = []
-    rlen = size + 2
-    while rlen - len(buf) > 0:
-        if buf:
-            rlen -= len(buf)
-            chunks.append(buf)
-        buf = _recv(sock, RECV_SIZE)
-        if not buf:
-            raise MemcacheUnexpectedCloseError()
+    with tracer.span(name='pymemcache.client._readvalue') as span:
+        chunks = []
+        rlen = size + 2
+        while rlen - len(buf) > 0:
+            if buf:
+                rlen -= len(buf)
+                chunks.append(buf)
+            buf = _recv(sock, RECV_SIZE, tracer)
+            if not buf:
+                raise MemcacheUnexpectedCloseError()
 
-    # Now we need to remove the \r\n from the end. There are two cases we care
-    # about: the \r\n is all in the last buffer, or only the \n is in the last
-    # buffer, and we need to remove the \r from the penultimate buffer.
+        # Now we need to remove the \r\n from the end. There are two cases we care
+        # about: the \r\n is all in the last buffer, or only the \n is in the last
+        # buffer, and we need to remove the \r from the penultimate buffer.
 
-    if rlen == 1:
-        # replace the last chunk with the same string minus the last character,
-        # which is always '\r' in this case.
-        chunks[-1] = chunks[-1][:-1]
-    else:
-        # Just remove the "\r\n" from the latest chunk
-        chunks.append(buf[:rlen - 2])
+        if rlen == 1:
+            # replace the last chunk with the same string minus the last character,
+            # which is always '\r' in this case.
+            chunks[-1] = chunks[-1][:-1]
+        else:
+            # Just remove the "\r\n" from the latest chunk
+            chunks.append(buf[:rlen - 2])
 
-    return buf[rlen:], b''.join(chunks)
+        return buf[rlen:], b''.join(chunks)
 
-
-def _recv(sock, size):
+def _recv(sock, size, tracer):
     """sock.recv() with retry on EINTR"""
-    while True:
-        try:
-            return sock.recv(size)
-        except IOError as e:
-            if e.errno != errno.EINTR:
-                raise
+    with tracer.span(name='pymemcache.client._recv') as span:
+        while True:
+            try:
+                return sock.recv(size)
+            except IOError as e:
+                if e.errno != errno.EINTR:
+                    raise
