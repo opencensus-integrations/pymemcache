@@ -31,7 +31,7 @@ from pymemcache.exceptions import (
 
 RECV_SIZE = 4096
 VALID_STORE_RESULTS = {
-    b'set':     (b'STORED',),
+    b'set':     (b'STORED', b'NOT_STORED'),
     b'add':     (b'STORED', b'NOT_STORED'),
     b'replace': (b'STORED', b'NOT_STORED'),
     b'append':  (b'STORED', b'NOT_STORED'),
@@ -109,11 +109,11 @@ def _check_key(key, allow_unicode_keys, key_prefix=b''):
             )
         elif c == ord(b'\00'):
             raise MemcacheIllegalInputError(
-              "Key contains null character: '%r'" % (key,)
+                "Key contains null character: '%r'" % (key,)
             )
         elif c == ord(b'\r'):
             raise MemcacheIllegalInputError(
-              "Key contains carriage return: '%r'" % (key,)
+                "Key contains carriage return: '%r'" % (key,)
             )
     return key
 
@@ -325,19 +325,22 @@ class Client(object):
                    self.default_noreply).
 
         Returns:
-          If no exception is raised, always returns True. Otherwise all, some
-          or none of the keys have been successfully set. If noreply is True
-          then a successful return does not guarantee that any keys were
-          successfully set (just that the keys were successfully sent).
+          Returns a list of keys that failed to be inserted.
+          If noreply is True, alwais returns empty list.
         """
-
         # TODO: make this more performant by sending all the values first, then
         # waiting for all the responses.
         with self._tracer.span(name='pymemcache.client.Client.set_many') as span:
             span.add_annotation('Setting many', count=len(values))
+            if noreply is None:
+                noreply = self.default_noreply
+
+            failed = []
             for key, value in six.iteritems(values):
-                self.set(key, value, expire, noreply)
-            return True
+                result = self.set(key, value, expire, noreply)
+                if not result:
+                    failed.append(key)
+            return failed
 
     set_multi = set_many
 
@@ -695,9 +698,9 @@ class Client(object):
             cmd = b"version\r\n"
             result = self._misc_cmd(cmd, b'version', False)
 
-            if not result.startswith(b'VERSION '):
-                raise MemcacheUnknownError(
-                        "Received unexpected response: %s" % (result, ))
+        if not result.startswith(b'VERSION '):
+            raise MemcacheUnknownError(
+                "Received unexpected response: %s" % (result, ))
 
             return result[8:]
 
@@ -1007,7 +1010,8 @@ class PooledClient(object):
     def set_many(self, values, expire=0, noreply=None):
         with self._tracer.span(name='pymemcache.client.PooledClient.set_many'):
             with self.client_pool.get_and_release(destroy_on_fail=True) as client:
-                return client.set_many(values, expire=expire, noreply=noreply)
+                failed = client.set_many(values, expire=expire, noreply=noreply)
+                return failed
 
     set_multi = set_many
 
